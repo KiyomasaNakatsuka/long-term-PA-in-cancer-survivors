@@ -1,0 +1,2358 @@
+---
+title: "analysis_cancer_active"
+author: "kiyo"
+date: "2024-05-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(data.table)
+library(lubridate)
+library(tableone)
+library(survival)
+library(survminer)
+library(broom)
+library(furrr)
+library(tidycmprsk)
+library(timereg)
+library(riskRegression)
+library(prodlim)
+```
+
+
+```{r, include=FALSE}
+path <- list.files("O:/中塚/kenshin_active/input/data_remake", pattern = "datafix2.csv", full.names = TRUE)
+
+check <- fread("O:/中塚/kenshin_active/input/data_remake/C001datafix2.csv")
+
+base <- path %>% 
+  future_map(~ read_csv(.) %>% 
+               select(rtid2:cfi_score) %>% 
+               rename(nintei = nintei.x, nintei2 = nintei.y) %>% 
+               mutate(across(c(ken_date:ken_bdate, height:Cr, fmon:cancerdate,
+                               deathdate, deathdate_ltc, shinseidate, shinseimonth), ~ as.numeric(.x)),
+                      across(c(rtid2, ken_sex, smoke:alcho, icd1:icd_c,
+                               death, deathltc, kubun, nintei, shinki), ~ as.character(.x)))) %>% 
+  bind_rows(., .id = "filename") 
+
+data1 <- base %>% 
+  mutate(observe = if_else(kenmonth<=lmon, 0, 1),
+         end_death = case_when(!(is.na(deathdate)) & !(is.na(deathdate_ltc)) & deathdate>=deathdate_ltc ~ ymd(paste0(deathdate, "15")),
+                               !(is.na(deathdate)) & !(is.na(deathdate_ltc)) & deathdate<deathdate_ltc ~ ymd(paste0(deathdate_ltc, "15")),
+                               !(is.na(deathdate)) & is.na(deathdate_ltc) ~ ymd(paste0(deathdate, "15")),
+                               is.na(deathdate) & !(is.na(deathdate_ltc)) ~ ymd(paste0(deathdate_ltc, "15")),
+                               TRUE ~ ymd(paste0(lmon, "15"))),
+         end_ltc = case_when(!(is.na(shinseidate)) ~ ymd(shinseidate),
+                             !(is.na(deathdate)) & !(is.na(deathdate_ltc)) & deathdate>=deathdate_ltc ~ ymd(paste0(deathdate, "15")),
+                               !(is.na(deathdate)) & !(is.na(deathdate_ltc)) & deathdate<deathdate_ltc ~ ymd(paste0(deathdate_ltc, "15")),
+                               !(is.na(deathdate)) & is.na(deathdate_ltc) ~ ymd(paste0(deathdate, "15")),
+                               is.na(deathdate) & !(is.na(deathdate_ltc)) ~ ymd(paste0(deathdate_ltc, "15")),
+                               TRUE ~ ymd(paste0(lmon, "15"))),
+         kenshin2 = ymd(ken_date),
+         follow_death = as.numeric(difftime(end_death, kenshin2, units = "days")),
+         follow_ltc = as.numeric(difftime(end_ltc, kenshin2, units = "days")),
+         exclude_ltc = if_else(shinseidate<ken_date | already_ltc_fix==1 | already_ltc_koushin==1, "exclude", "include"),
+         ltc = if_else(!(is.na(shinki)), 1, 0),
+         death01 = if_else(!(is.na(death)) | !(is.na(deathltc)), 1, 0),
+         exercise = case_when(exercise=="1" ~ "運動習慣あり", exercise=="2" ~ "運動習慣なし"),
+         smoke = case_when(smoke=="2" ~ "喫煙習慣なし", smoke=="1" ~ "喫煙習慣あり"),
+         alcho = case_when(alcho=="1" ~ "飲酒習慣あり(毎日)", alcho=="2" ~ "飲酒習慣あり(時々)", alcho=="3" ~ "飲酒習慣なし") %>% 
+           factor(c("飲酒習慣あり(毎日)", "飲酒習慣あり(時々)", "飲酒習慣なし"), levels = c("飲酒習慣なし", "飲酒習慣あり(時々)", "飲酒習慣あり(毎日)")),
+         bmi_c = case_when(bmi<18.5 ~ "1.BMI18.5未満",
+                           bmi<25 ~ "2.BMI18.5以上25未満",
+                           bmi>=25 ~ "3.BMI25以上"),
+         age = as.numeric(str_sub(kenmonth - ken_bdate, start = 1, end = -3)),
+         female = if_else(ken_sex==2, 1, 0),
+         cfi = case_when(cfi_score<0.15 ~ "1.robust",
+                         cfi_score<0.25 ~ "2.prefrail",
+                         cfi_score>=0.25 ~ "3.frail"),
+         lung = case_when((icd10=="C33" | icd10=="C34") & utagai!=1 ~ 1, TRUE ~ 0),
+         stomach = case_when(icd10=="C16" & utagai!=1 ~ 1, TRUE ~ 0),
+         colon = case_when((icd10=="C18" | icd10=="C19" | icd10=="C20") & utagai!=1 ~ 1, TRUE ~ 0),
+         liver = case_when(icd10=="C22" & utagai!=1 ~ 1, TRUE ~ 0),
+         pancreatic = case_when(icd10=="C25" & utagai!=1 ~ 1, TRUE ~ 0),
+         prostate = case_when(icd10=="C61" & utagai!=1 ~ 1, TRUE ~ 0),
+         breast = case_when(icd10=="C50" & utagai!=1 ~ 1, TRUE ~ 0),
+         cancertype = case_when(lung==1 ~ "lung",
+                                stomach==1 ~ "stomach",
+                                colon==1 ~ "colon",
+                                liver==1 ~ "liver",
+                                pancreatic==1 ~ "pancreatic",
+                                prostate==1 ~ "prostate",
+                                breast==1 ~ "breast",
+                                (icd10=="C53" | icd10=="C54" | icd10=="C55") & utagai!=1 ~ "uterine",
+                                icd10=="C67" & utagai!=1 ~ "bladder",
+                                icd10=="C85" & utagai!=1 ~ "non_hodgkin",
+                                (icd10=="C81" | icd10=="C82" | icd10=="C83" | icd10=="C84" | icd10=="C85" | icd10=="C86" | icd10=="C88" | 
+                                   icd10=="C90" | icd10=="C91" | icd10=="C92" | icd10=="C93" | icd10=="C94" | icd10=="C95" | icd10=="C96") & utagai!=1 ~ "blood",
+                                TRUE ~ "other"),
+         cancertype2 = case_when(lung==1 ~ "lung",
+                                stomach==1 ~ "stomach",
+                                colon==1 ~ "colon",
+                                prostate==1 ~ "prostate",
+                                breast==1 ~ "breast",
+                                (icd10=="C53" | icd10=="C54" | icd10=="C55") & utagai!=1 ~ "uterine",
+                                (icd10=="C81" | icd10=="C82" | icd10=="C83" | icd10=="C84" | icd10=="C85" | icd10=="C86" | icd10=="C88" | 
+                                   icd10=="C90" | icd10=="C91" | icd10=="C92" | icd10=="C93" | icd10=="C94" | icd10=="C95" | icd10=="C96") & utagai!=1 ~ "blood",
+                                TRUE ~ "other"),
+         walk = case_when(walk=="1" ~ "歩行習慣あり", walk=="2" ~ "歩行習慣なし"),
+         exercise3 = case_when((exercise=="運動習慣あり" & walk=="歩行習慣なし") | (exercise=="運動習慣なし" & walk=="歩行習慣あり") ~ "0.運動or歩行",
+                               exercise=="運動習慣あり" & walk=="歩行習慣あり" ~ "1.運動かつ歩行",
+                               exercise=="運動習慣なし" & walk=="歩行習慣なし" ~ "2.どちらもなし"),
+         exercise2 = case_when(exercise=="運動習慣あり" & walk=="歩行習慣あり" ~ "0.運動かつ歩行",
+                               (exercise=="運動習慣あり" & walk=="歩行習慣なし") | (exercise=="運動習慣なし" & walk=="歩行習慣あり") ~ "1.運動or歩行",
+                               exercise=="運動習慣なし" & walk=="歩行習慣なし" ~ "2.どちらもなし"),
+         age75over = case_when(age>=75 ~ "75over", age>=65 ~ "65~74", age<65 ~ "~64"))
+
+table(data1$icd10)
+
+#時間をある程度調整
+data2 <- data1 %>% 
+  mutate(death = as.numeric(if_else(follow_death>=1440 & death01==1, 0, death01)),
+         ltc = if_else(follow_ltc>=1440 & ltc==1, 0, ltc),
+         ltc2 = if_else(ymd(shinseidate_ltc2)>=kenshin2, 1, 0),
+         outcome = if_else(death==1 | ltc==1, 1, 0),
+         outcome2 = if_else(death==1 | ltc2==1, 1, 0),
+         follow_death = if_else(follow_death>=1440, 1440, follow_death),
+         follow_ltc = if_else(follow_ltc>=1440, 1440, follow_ltc),
+         follow = if_else(follow_ltc<=follow_death, follow_ltc, follow_death),
+         follow2 = case_when(ltc2==1 ~ as.numeric(difftime(shinseidate_ltc2, kenshin2, units = "days")),
+                             TRUE ~ follow_death),
+         exclude_ltc2 = if_else(ymd(shinseidate_ltc2)<kenshin2, 1, 0),
+         exclude_ltc2 = if_else(is.na(exclude_ltc2), 0, exclude_ltc2))
+
+
+```
+
+## table1
+
+```{r, echo=FALSE}
+tdata_ew <- data2 %>% 
+  filter(observe!=1) %>% 
+  filter(!(is.na(exercise)) & !(is.na(walk))) %>% 
+  filter(exclude_ltc=="include" | is.na(exclude_ltc)) %>% 
+  filter(follow>0)
+
+listvar = c("age", "age75over", "female", "weight", "height", "bmi_c", "sbp", "dbp", "HDL", "LDL", "TG", "HbA1c", "smoke", "alcho", "cancertype", 
+            "cfi", "outcome", "death", "ltc", "follow")
+listcat = c("age75over", "female", "bmi_c", "smoke", "alcho", "cancertype", 
+            "cfi", "outcome", "death", "ltc")
+
+ftable <- CreateTableOne(vars = listvar, factorVars = listcat, strata = "exercise2", addOverall = TRUE, data = tdata_ew)
+kableone(ftable)
+
+#人年換算
+jinnen <- tdata_ew %>% 
+  group_by(exercise2) %>% 
+  summarise(jinnen = sum(follow),
+         jinnen_death = sum(follow_death),
+         outcome_s = sum(outcome),
+         ltc_s = sum(ltc),
+         death_s = sum(death)) %>%
+  ungroup() %>% 
+  mutate(jinnen = jinnen/365.25,
+         jinnen_death = jinnen_death/365.25,
+         outcome_r = outcome_s/jinnen,
+         ltc_r = ltc_s/jinnen,
+         death_r = death_s/jinnen_death,
+         across(c(outcome_r:death_r), ~ round(.x*100, digits = 2))) %>% 
+  t()
+
+jinnen
+
+tdata_ex <- data2 %>% 
+  filter(observe!=1) %>% 
+  filter(exclude_ltc=="include" | is.na(exclude_ltc)) %>% 
+  filter(follow>0) %>% 
+  mutate(exclusion = if_else(!(is.na(exercise)) & !(is.na(walk)), "inclusion", "exclusion"))
+  
+
+listvar = c("age", "age75over", "female", "weight", "height", "bmi_c", "sbp", "dbp", "HDL", "LDL", "TG", "HbA1c", "smoke", "alcho", "cancertype", 
+            "cfi", "outcome", "death", "ltc")
+listcat = c("age75over", "female", "bmi_c", "smoke", "alcho", "cancertype", 
+            "cfi", "outcome", "death", "ltc")
+
+extable <- CreateTableOne(vars = listvar, factorVars = listcat, strata = "exclusion", addOverall = TRUE, data = tdata_ex)
+kableone(extable)
+```
+
+
+
+## アウトカム発生(全数)
+
+```{r, echo=FALSE}
+exercisegroup <- c("Exercise and walking", "Exercise or walking", "No physical activity")
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ew)
+
+ggsurvplot(survival, data = tdata_ew,
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ew)
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ew)
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+
+## アウトカム発生(全数 ~65)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(age<65))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(age<75),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(age<65))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ew %>% filter(age<65))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+
+## アウトカム発生(全数 65~74)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(age<75 & age>=65))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(age<75),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(age<75))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ew %>% filter(age<75))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(全数 75~)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(age>=75))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(age>=75),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(age>=75))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ew %>% filter(age>=75))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生（肺）
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="lung"))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="lung"),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="lung"))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ew %>% filter(cancertype=="lung"))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(大腸)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="colon"))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="colon"),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="colon"))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ew %>% filter(cancertype=="colon"))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(肝臓)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="liver"))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="liver"),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="liver"))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ew %>% filter(cancertype=="liver"))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(胃)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="stomach"))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="stomach"),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="stomach"))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ew %>% filter(cancertype=="stomach"))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(膵臓)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="pancreatic"))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="pancreatic"),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="pancreatic"))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ew %>% filter(cancertype=="pancreatic"))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(乳がん)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="breast" & female==1))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="breast" & female==1),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+
+#単変量
+cox_death <- coxph(Surv(follow_death, death) ~ exercise2, data = tdata_ew %>% filter(cancertype=="breast" & female==1))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow_death, death) ~ exercise2 + age + bmi_c + cfi + smoke + alcho, data = tdata_ew %>% filter(cancertype=="breast" & female==1))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "BMI 18~25", row==5 ~ "BMI 25~",
+                         row==6 ~ "cfi prefrail", row==7 ~ "cfi frail",
+                         row==8 ~ "喫煙習慣なし", row==9 ~ "飲酒習慣(時々)", row==10 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(前立腺)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="prostate" & female==0))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="prostate" & female==0),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="prostate" & female==0))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + bmi_c + cfi + smoke + alcho, data = tdata_ew %>% filter(cancertype=="prostate" & female==0))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "BMI 18~25", row==5 ~ "BMI 25~",
+                         row==6 ~ "cfi prefrail", row==7 ~ "cfi frail",
+                         row==8 ~ "喫煙習慣なし", row==9 ~ "飲酒習慣(時々)", row==10 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(血液がん)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="blood"))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="blood"),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="blood"))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ew %>% filter(cancertype=="blood"))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(膀胱)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="bladder"))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="bladder"),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="bladder"))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ew %>% filter(cancertype=="bladder"))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(子宮)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="uterine" & female==1))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="uterine" & female==1),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ew %>% filter(cancertype=="uterine" & female==1))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + bmi_c + cfi + smoke + alcho, data = tdata_ew %>% filter(cancertype=="uterine" & female==1))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "BMI 18~25", row==5 ~ "BMI 25~",
+                         row==6 ~ "cfi prefrail", row==7 ~ "cfi frail",
+                         row==8 ~ "喫煙習慣なし", row==9 ~ "飲酒習慣(時々)", row==10 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+
+
+## 感度分析(死亡)
+
+```{r, echo=FALSE}
+
+#単変量
+cox_death <- coxph(Surv(follow_death, death) ~ exercise2, data = tdata_ew)
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow_death, death) ~ exercise2 + age + bmi_c + cfi + smoke + alcho, data = tdata_ew)
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "BMI 18~25", row==5 ~ "BMI 25~",
+                         row==6 ~ "cfi prefrail", row==7 ~ "cfi frail",
+                         row==8 ~ "喫煙習慣なし", row==9 ~ "飲酒習慣(時々)", row==10 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+```
+
+## 感度分析(要介護)
+
+```{r, echo=FALSE}
+cmprskdata <- tdata_ew %>% 
+  mutate(cmp_outcome = case_when(ltc==1 ~ "onset",
+                                 death01==1 ~ "death",
+                                 TRUE ~ "censor"),
+         cmp_outcome = fct_relevel(cmp_outcome, "censor", "death", "onset"),
+         alcho2 = case_when(alcho=="飲酒習慣あり(毎日)" ~ "0", alcho=="飲酒習慣あり(時々)" ~ "1", alcho=="飲酒習慣なし" ~ "")) %>% 
+  filter(!(is.na(bmi_c)) & !(is.na(cfi)) & !(is.na(alcho)))
+  
+fit_crude <- riskRegression(Hist(follow, cmp_outcome, cens.code = "censor") ~ exercise2, 
+                          data = cmprskdata,
+               cause = "onset",
+               link = "prop")
+summary(fit_crude)
+
+fit_cmp <- riskRegression(Hist(follow, cmp_outcome, cens.code = "censor") ~ exercise2 + age + bmi_c + cfi + smoke + alcho2, 
+                          data = cmprskdata,
+               cause = "onset",
+               link = "prop")
+summary(fit_cmp)
+```
+
+
+## アウトカム発生(全数)
+
+```{r, echo=FALSE}
+exercisegroup <- c("Exercise and walking", "Exercise or walking", "No physical activity")
+tdata_ltc2 <- data2 %>% 
+  filter(observe!=1) %>% 
+  filter(!(is.na(exercise)) & !(is.na(walk))) %>% 
+  filter(exclude_ltc2==0) %>% 
+  filter(follow>0)
+
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2)
+
+ggsurvplot(survival, data = tdata_ew,
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2)
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ltc2)
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+
+## アウトカム発生(全数 ~65)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(age<65))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(age<75),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(age<65))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ltc2 %>% filter(age<65))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+
+## アウトカム発生(全数 65~74)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(age<75 & age>=65))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(age<75),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(age<75))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ltc2 %>% filter(age<75))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(全数 75~)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(age>=75))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(age>=75),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(age>=75))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ltc2 %>% filter(age>=75))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生（肺）
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="lung"))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="lung"),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="lung"))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ltc2 %>% filter(cancertype=="lung"))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(大腸)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="colon"))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="colon"),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="colon"))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ltc2 %>% filter(cancertype=="colon"))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(肝臓)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="liver"))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="liver"),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="liver"))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ltc2 %>% filter(cancertype=="liver"))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(胃)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="stomach"))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="stomach"),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="stomach"))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ltc2 %>% filter(cancertype=="stomach"))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(膵臓)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="pancreatic"))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="pancreatic"),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="pancreatic"))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ltc2 %>% filter(cancertype=="pancreatic"))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(乳がん)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="breast" & female==1))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="breast" & female==1),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+
+#単変量
+cox_death <- coxph(Surv(follow_death, death) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="breast" & female==1))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow_death, death) ~ exercise2 + age + bmi_c + cfi + smoke + alcho, data = tdata_ltc2 %>% filter(cancertype=="breast" & female==1))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "BMI 18~25", row==5 ~ "BMI 25~",
+                         row==6 ~ "cfi prefrail", row==7 ~ "cfi frail",
+                         row==8 ~ "喫煙習慣なし", row==9 ~ "飲酒習慣(時々)", row==10 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(前立腺)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="prostate" & female==0))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="prostate" & female==0),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="prostate" & female==0))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + bmi_c + cfi + smoke + alcho, data = tdata_ltc2 %>% filter(cancertype=="prostate" & female==0))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "BMI 18~25", row==5 ~ "BMI 25~",
+                         row==6 ~ "cfi prefrail", row==7 ~ "cfi frail",
+                         row==8 ~ "喫煙習慣なし", row==9 ~ "飲酒習慣(時々)", row==10 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(血液がん)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="blood"))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="blood"),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="blood"))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ltc2 %>% filter(cancertype=="blood"))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(膀胱)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="bladder"))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="bladder"),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="bladder"))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + female + bmi_c + cfi + smoke + alcho, data = tdata_ltc2 %>% filter(cancertype=="bladder"))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "female",
+                         row==5 ~ "BMI 18~25", row==6 ~ "BMI 25~",
+                         row==7 ~ "cfi prefrail", row==8 ~ "cfi frail",
+                         row==9 ~ "喫煙習慣なし", row==10 ~ "飲酒習慣(時々)", row==11 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+## アウトカム発生(子宮)
+
+```{r, echo=FALSE}
+#cox analysis
+survival <- survfit(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="uterine" & female==1))
+
+ggsurvplot(survival, data = tdata_ew %>% filter(cancertype=="uterine" & female==1),
+           pval = TRUE,  
+           pval.size = 6,
+           pval.coord = c(300, 0.7),
+           ylim=c(0.6, 1),
+           risk.table = TRUE, 
+           risk.table.height = 0.4,
+           break.time = 300,
+           xlim = c(0,1500),
+           xlab = "Time in days", 
+           censor = FALSE,
+           legend.lab = exercisegroup,
+           font.legend = list(size = 10, face = "bold"))
+
+
+#単変量
+cox_death <- coxph(Surv(follow, outcome) ~ exercise2, data = tdata_ltc2 %>% filter(cancertype=="uterine" & female==1))
+summary(cox_death)
+
+data <- as.list(summary(cox_death))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row")
+
+
+#調整
+cox_death_a <- coxph(Surv(follow, outcome) ~ exercise2 + age + bmi_c + cfi + smoke + alcho, data = tdata_ltc2 %>% filter(cancertype=="uterine" & female==1))
+summary(cox_death_a)
+
+data <- as.list(summary(cox_death_a))
+
+P <- data.frame(data$coefficients) %>% 
+  select(Pr...z..) %>% 
+  rename(P = Pr...z..) %>% 
+  mutate(row = row_number())
+
+data_cox_death_a <- data.frame(data$conf.int) %>% 
+  mutate(row = row_number()) %>% 
+  rename(HR = exp.coef.,
+         CI_lower = lower..95,
+         CI_higher = upper..95) %>% 
+  select(row, HR, CI_lower, CI_higher) %>% 
+  left_join(P, by="row") %>% 
+  rename_with( ~ str_c(.x, "_adjust"), !row)
+
+death_table <- data_cox_death %>% 
+  full_join(data_cox_death_a, by="row") %>% 
+  mutate(row = case_when(row==1 ~ "どちらかだけ(ref 運動かつ歩行)",
+                         row==2 ~ "どちらもなし(ref 運動かつ歩行)",
+                         row==3 ~ "age", row==4 ~ "BMI 18~25", row==5 ~ "BMI 25~",
+                         row==6 ~ "cfi prefrail", row==7 ~ "cfi frail",
+                         row==8 ~ "喫煙習慣なし", row==9 ~ "飲酒習慣(時々)", row==10 ~ "飲酒習慣(毎日)"))
+
+kableone(death_table)
+
+
+```
+
+
+
